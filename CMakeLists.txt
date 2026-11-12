@@ -19,7 +19,9 @@ find_package(Eigen3 REQUIRED)
 ###############################################################################
 add_library(dg_core
     src/dg/mesh.cpp
-    src/dg/solver.cpp
+    src/dg/dg_solver.cpp
+    src/dg/dguf_solver.cpp
+    src/dg/ipdg_solver.cpp
     src/dg/reference_element.cpp
 )
 
