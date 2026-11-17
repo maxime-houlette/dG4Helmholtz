@@ -10,6 +10,8 @@ static std::unique_ptr<ReferenceElement> make_reference_element(size_t dim, size
 {
     if (dim == 1)
         return std::make_unique<ReferenceInterval>(degree);
+    if (dim == 2)
+        return std::make_unique<ReferenceTriangle>(degree);
     throw std::invalid_argument("DGSolver: no reference element available in dimension " + std::to_string(dim));
 }
 
@@ -305,6 +307,12 @@ DGSolver::ErrorNorms DGSolver::integrate_errors() const
         }
     }
     return norms;
+}
+
+double DGSolver::relative_L2_error() const
+{
+    ErrorNorms norms = integrate_errors();
+    return std::sqrt(norms.err_L2_sq / norms.sol_L2_sq);
 }
 
 void DGSolver::compute_errors(const std::string &filename)
