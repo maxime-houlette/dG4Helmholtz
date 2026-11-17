@@ -1,47 +1,31 @@
 #pragma once
 
 #include <complex>
-#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 #include <Eigen/Sparse>
 #include <Eigen/Dense>
 
+#include "types.h"
 #include "mesh.h"
 #include "reference_element.h"
 
-using RhsFunction = std::function<std::complex<double>(double)>;
-typedef Eigen::Triplet<std::complex<double>> TripletComplex;
-
-inline const std::complex<double> I(0.0, 1.0);
-
-enum BCType
-{
-    Dirichlet = 0,
-    Neumann = 1,
-    Robin = 2
-};
-
-/* Unknown fields. IPDG only has U, dGUF has U and Q. */
-enum Variable
-{
-    U = 0,
-    Q = 1
-};
-
 /*
- * Common base class of the 1D dG solvers (dGUF and IPDG) for the Helmholtz equation on (0, L).
+ * Common base class of the dG solvers (dGUF and IPDG) for the Helmholtz equation, in any dimension.
  *
  * It owns the mesh, the reference element, the linear system A x = b and the discrete solution, and
- * implements everything that does not depend on the method: dof numbering, right-hand side, linear
- * solve, post-processing and error computation.
+ * implements everything that does not depend on the method: dof numbering, assembly loops,
+ * right-hand side, linear solve, post-processing and error computation.
  *
- * A derived class only provides the bilinear form through
- *     assemble_volume(), assemble_interfaces(), assemble_boundaries(),
+ * A derived class only provides the local contributions of the sesquilinear form:
+ *     assemble_element(e)        volume terms on element e,
+ *     assemble_interface(F)      terms on an interface F,
+ *     assemble_boundary_face(F)  terms on a boundary face F,
  * and must call assemble() at the end of its constructor.
  *
- * Dof numbering: element by element, and inside an element field by field (U first, then Q):
- *     global = (n_fields * e + var) * (p + 1) + i.
+ * Dof numbering: element by element, and inside an element field by field (u, then q_1, ..., q_d):
+ *     global = (n_fields * e + field) * n_basis + i.
  */
 class DGSolver
 {
@@ -51,11 +35,11 @@ public:
     void solve();
     void post_process_u();
     void post_process_u_exact();
-    void plot_u();
-    void plot_error();
+    void plot_u();     // 1D only (gnuplot)
+    void plot_error(); // 1D only (gnuplot)
 
     /* Appends a line "N,degree,kappa/Pi,[method-specific columns,]error_L2" to `filename`
-     * (default_error_file() if empty). error_L2 is the relative L2 error on u. */
+     * (default_error_file() if empty), with N the number of elements and error_L2 the relative L2 error on u. */
     void compute_errors(const std::string &filename = "");
 
     const Eigen::VectorXcd &get_solution() const { return u; }
@@ -66,12 +50,12 @@ protected:
              size_t input_n_fields,
              double input_kappa,
              BCType input_bc_type,
-             RhsFunction input_f_rhs,
-             RhsFunction input_u_exact,
-             RhsFunction input_du_exact);
+             ScalarFunction input_f_rhs,
+             ScalarFunction input_u_exact,
+             VectorFunction input_grad_u_exact);
 
     Mesh mesh;
-    ReferenceElement ref_element;
+    std::unique_ptr<ReferenceElement> ref;
     size_t n_fields;
     double kappa;
     BCType bc_type;
@@ -81,31 +65,44 @@ protected:
     Eigen::VectorXcd u;
     std::vector<TripletComplex> tripletList;
 
-    RhsFunction f_rhs = nullptr;
-    RhsFunction u_exact = nullptr;
-    RhsFunction du_exact = nullptr;
-
-    /* Reference basis functions and their (reference) derivatives at xi = -1 (L) and xi = +1 (R) */
-    std::vector<double> phi_L, phi_R, dphi_L, dphi_R;
+    ScalarFunction f_rhs = nullptr;
+    ScalarFunction u_exact = nullptr;
+    VectorFunction grad_u_exact = nullptr;
 
     /* --- Assembly --- */
-    void assemble(); // volume, interfaces, boundaries, then rhs
-    virtual void assemble_volume() = 0;
-    virtual void assemble_interfaces() = 0;
-    virtual void assemble_boundaries() = 0;
-    void assemble_rhs(); // (f, phi_i) on the U rows
+    void assemble(); // elements, faces, then rhs
+    virtual void assemble_element(size_t e) = 0;
+    virtual void assemble_interface(const Face &F) = 0;
+    virtual void assemble_boundary_face(const Face &F) = 0;
+    void assemble_rhs(); // (f, phi_i) on the u rows
 
-    /* --- Helpers --- */
-    size_t n_local_dofs() const { return ref_element.degree + 1; }
-    size_t local_to_global(size_t element, Variable var, size_t local_dof) const;
-    std::complex<double> eval_u(size_t element, double xi) const;
-    std::complex<double> eval_du(size_t element, double xi) const; // physical derivative
+    /* Adds the dense local matrix A_loc, whose rows/columns correspond to `dofs`, to the global matrix */
+    void scatter(const std::vector<size_t> &dofs, const Eigen::MatrixXcd &A_loc);
+
+    /* --- Dofs and basis functions --- */
+    size_t dim() const { return mesh.dim; }
+    size_t n_local_dofs() const { return ref->n_basis(); }
+    size_t local_to_global(size_t element, size_t field, size_t local_dof) const;
+
+    Eigen::VectorXd basis_values(const Point &xi) const;                 // phi_i(xi), i = 0..n-1
+    Eigen::MatrixXd basis_grads(size_t element, const Point &xi) const; // row i = physical grad phi_i at F_K(xi)
+    std::complex<double> eval_u(size_t element, const Point &xi) const;
+    CPoint eval_grad_u(size_t element, const Point &xi) const;
+
+    /* --- Face quadrature --- */
+    struct FaceQuadPoint
+    {
+        Point x;     // physical point
+        double w;    // weight (including |F| / |F^|)
+        Point xi[2]; // reference coordinates in elem[0] and elem[1] (= xi[0] on a boundary face)
+    };
+    std::vector<FaceQuadPoint> face_quadrature(const Face &F) const; // exact for degree 2p
 
     /* --- Errors --- */
     struct ErrorNorms
     {
         double err_L2_sq = 0., sol_L2_sq = 0.; // ||u - u_h||^2, ||u||^2
-        double err_H1_sq = 0., sol_H1_sq = 0.; // ||u' - u_h'||_{T_h}^2, ||u'||^2 (only if du_exact is provided)
+        double err_H1_sq = 0., sol_H1_sq = 0.; // ||grad(u - u_h)||_{T_h}^2, ||grad u||^2 (if grad_u_exact is provided)
     };
     ErrorNorms integrate_errors() const;
 

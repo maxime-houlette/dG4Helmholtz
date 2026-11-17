@@ -52,3 +52,23 @@ target_compile_options(main_exec PRIVATE
 
 # On lie l'exécutable à notre propre bibliothèque dg_core
 target_link_libraries(main_exec PRIVATE dg_core)
+
+###############################################################################
+# 3. TEST DE NON-REGRESSION (compare au code 1D de reference, tests/reference/)
+###############################################################################
+add_executable(regression_test
+    tests/regression.cpp
+)
+
+target_compile_options(regression_test PRIVATE
+    -Wall -Wextra -Wpedantic
+)
+
+target_compile_definitions(regression_test PRIVATE
+    REFERENCE_DIR="${CMAKE_SOURCE_DIR}/tests/reference"
+)
+
+target_link_libraries(regression_test PRIVATE dg_core)
+
+enable_testing()
+add_test(NAME regression COMMAND regression_test)

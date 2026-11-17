@@ -1,21 +1,19 @@
-#include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <cmath>
 #include "ipdg_solver.h"
-#include "mass.h"
-#include "stiffness.h"
+#include "local_matrices.h"
 using namespace std;
 
 IPDGSolver::IPDGSolver(const Mesh &input_mesh,
                        size_t degree,
                        double input_kappa,
                        BCType input_bc_type,
-                       RhsFunction input_f_rhs,
-                       RhsFunction input_u_exact,
-                       RhsFunction input_du_exact,
+                       ScalarFunction input_f_rhs,
+                       ScalarFunction input_u_exact,
+                       VectorFunction input_grad_u_exact,
                        double input_gamma)
-    : DGSolver(input_mesh, degree, 1, input_kappa, input_bc_type, input_f_rhs, input_u_exact, input_du_exact),
+    : DGSolver(input_mesh, degree, 1, input_kappa, input_bc_type, input_f_rhs, input_u_exact, input_grad_u_exact),
       gamma(input_gamma)
 {
     if (bc_type == Neumann)
@@ -30,117 +28,96 @@ std::string IPDGSolver::default_error_file() const
 }
 
 /* ======================================================================= */
-/*                                 VOLUME                                  */
+/*                                 ELEMENT                                 */
 /* ======================================================================= */
 
-/* -kappa^2 (v, w)_K + (v', w')_K */
-void IPDGSolver::assemble_volume()
+/* -kappa^2 (v, w)_K + (grad v, grad w)_K */
+void IPDGSolver::assemble_element(size_t e)
 {
-    size_t n_loc = n_local_dofs();
+    size_t n = n_local_dofs();
+    const Element &K = mesh.elements[e];
 
-    Eigen::MatrixXcd M_loc(n_loc, n_loc);
-    Eigen::MatrixXcd S_loc(n_loc, n_loc);
-    mass(ref_element, mesh.h, M_loc);
-    stiffness(ref_element, mesh.h, S_loc);
+    Eigen::MatrixXcd M, S;
+    local_mass(*ref, K, M);
+    local_stiffness(*ref, K, S);
 
-    Eigen::MatrixXcd K_loc = -kappa * kappa * M_loc + S_loc;
+    std::vector<size_t> dofs(n);
+    for (size_t i = 0; i < n; i++)
+        dofs[i] = local_to_global(e, U, i);
 
-    for (size_t e = 0; e < mesh.N; e++)
-        for (size_t i = 0; i < n_loc; i++)
-            for (size_t j = 0; j < n_loc; j++)
-                tripletList.push_back(TripletComplex(local_to_global(e, U, i), local_to_global(e, U, j), K_loc(i, j)));
+    scatter(dofs, -kappa * kappa * M + S);
 }
 
 /* ======================================================================= */
 /*                                  FACES                                  */
 /* ======================================================================= */
 
-/*
- * For a face F with normal n_F, `dofs` are the dofs touching F, with
- *   J[k] = contribution of dof k to [v] on F,     D[k] = contribution of dof k to {v'} on F.
- * Adds, for trial dof c and test dof a (A(a, c) = b_h(phi_c, phi_a)),
- *   gamma/h J[c] J[a] - n_F D[c] J[a] - n_F J[c] D[a].
- */
-void IPDGSolver::add_face_terms(const vector<size_t> &dofs, const vector<double> &J, const vector<double> &D, double n_F)
+void IPDGSolver::add_face_terms(Eigen::MatrixXcd &A_loc, const Eigen::VectorXd &J, const Eigen::VectorXd &D,
+                                double w, double h_F) const
 {
-    double pen = gamma / mesh.h;
-    for (size_t a = 0; a < dofs.size(); a++)
-        for (size_t c = 0; c < dofs.size(); c++)
-        {
-            double val = pen * J[c] * J[a] - n_F * D[c] * J[a] - n_F * J[c] * D[a];
-            if (val != 0.)
-                tripletList.push_back(TripletComplex(dofs[a], dofs[c], val));
-        }
+    double pen = gamma / h_F;
+    for (Eigen::Index a = 0; a < J.size(); a++)
+        for (Eigen::Index c = 0; c < J.size(); c++)
+            A_loc(a, c) += w * (pen * J(c) * J(a) - D(c) * J(a) - J(c) * D(a));
 }
 
-/* Interfaces x_{e+1}, between K_- = K_e (left) and K_+ = K_{e+1} (right), n_F = +1 */
-void IPDGSolver::assemble_interfaces()
+/* Local dofs: (side s, basis function i) -> s * n + i, with s = 0 for K_+ and s = 1 for K_- */
+void IPDGSolver::assemble_interface(const Face &F)
 {
-    size_t n_loc = n_local_dofs();
-    double dxi_dx = 2. / mesh.h;
+    size_t n = n_local_dofs();
+    const double sigma[2] = {1., -1.}; // [v] = v_+ - v_-
 
-    vector<size_t> dofs(2 * n_loc);
-    vector<double> J(2 * n_loc), D(2 * n_loc);
+    std::vector<size_t> dofs(2 * n);
+    for (size_t s = 0; s < 2; s++)
+        for (size_t i = 0; i < n; i++)
+            dofs[s * n + i] = local_to_global(F.elem[s], U, i);
 
-    for (size_t e = 0; e + 1 < mesh.N; e++)
+    Eigen::MatrixXcd A_loc = Eigen::MatrixXcd::Zero(2 * n, 2 * n);
+    Eigen::VectorXd J(2 * n), D(2 * n);
+
+    for (const FaceQuadPoint &qp : face_quadrature(F))
     {
-        for (size_t i = 0; i < n_loc; i++)
+        for (size_t s = 0; s < 2; s++)
         {
-            dofs[i] = local_to_global(e, U, i);
-            J[i] = phi_R[i];
-            D[i] = 0.5 * (dxi_dx * dphi_R[i]);
-
-            dofs[n_loc + i] = local_to_global(e + 1, U, i);
-            J[n_loc + i] = -phi_L[i];
-            D[n_loc + i] = 0.5 * (dxi_dx * dphi_L[i]);
-        }
-        add_face_terms(dofs, J, D, 1.);
-    }
-}
-
-/* ======================================================================= */
-/*                               BOUNDARIES                                */
-/* ======================================================================= */
-
-void IPDGSolver::assemble_boundaries()
-{
-    size_t n_loc = n_local_dofs();
-    double dxi_dx = 2. / mesh.h;
-
-    if (bc_type == Robin)
-    {
-        /* + i kappa <v, w>_{dOmega}, at x = 0 (element 0, xi = -1) and x = L (element N-1, xi = +1) */
-        complex<double> ik = I * kappa;
-        for (size_t i = 0; i < n_loc; i++)
-            for (size_t j = 0; j < n_loc; j++)
+            Eigen::VectorXd phi = basis_values(qp.xi[s]);
+            Eigen::VectorXd dn_phi = basis_grads(F.elem[s], qp.xi[s]) * F.normal; // grad phi . n_F
+            for (size_t i = 0; i < n; i++)
             {
-                tripletList.push_back(TripletComplex(local_to_global(0, U, i), local_to_global(0, U, j), ik * phi_L[j] * phi_L[i]));
-                tripletList.push_back(TripletComplex(local_to_global(mesh.N - 1, U, i), local_to_global(mesh.N - 1, U, j), ik * phi_R[j] * phi_R[i]));
+                J(s * n + i) = sigma[s] * phi(i);
+                D(s * n + i) = 0.5 * dn_phi(i);
             }
-        return;
+        }
+        add_face_terms(A_loc, J, D, qp.w, F.h);
     }
+    scatter(dofs, A_loc);
+}
 
-    /* Dirichlet: boundary faces, [v] = {v} = v|_F, outward normal */
-    vector<size_t> dofs(n_loc);
-    vector<double> J(n_loc), D(n_loc);
+void IPDGSolver::assemble_boundary_face(const Face &F)
+{
+    size_t n = n_local_dofs();
+    size_t e = F.elem[0];
 
-    /* x = 0, n_F = -1 */
-    for (size_t i = 0; i < n_loc; i++)
+    std::vector<size_t> dofs(n);
+    for (size_t i = 0; i < n; i++)
+        dofs[i] = local_to_global(e, U, i);
+
+    Eigen::MatrixXcd A_loc = Eigen::MatrixXcd::Zero(n, n);
+
+    for (const FaceQuadPoint &qp : face_quadrature(F))
     {
-        dofs[i] = local_to_global(0, U, i);
-        J[i] = phi_L[i];
-        D[i] = dxi_dx * dphi_L[i];
-    }
-    add_face_terms(dofs, J, D, -1.);
+        Eigen::VectorXd phi = basis_values(qp.xi[0]);
 
-    /* x = L, n_F = +1 */
-    for (size_t i = 0; i < n_loc; i++)
-    {
-        dofs[i] = local_to_global(mesh.N - 1, U, i);
-        J[i] = phi_R[i];
-        D[i] = dxi_dx * dphi_R[i];
+        if (bc_type == Robin)
+            /* + i kappa <v, w>_F */
+            A_loc += (I * kappa * qp.w) * (phi * phi.transpose()).cast<complex<double>>();
+        else
+        {
+            /* Dirichlet: [v] = {v} = v|_F, n_F outward */
+            Eigen::VectorXd dn_phi = basis_grads(e, qp.xi[0]) * F.normal;
+            add_face_terms(A_loc, phi, dn_phi, qp.w, F.h);
+        }
     }
-    add_face_terms(dofs, J, D, 1.);
+    scatter(dofs, A_loc);
 }
 
 /* ======================================================================= */
@@ -149,9 +126,9 @@ void IPDGSolver::assemble_boundaries()
 
 /*
  * Additional columns: gamma and the relative energy error |||u - u_h|||_dG / |||u|||_dG, with
- *   Dirichlet: |||v|||_dG^2 = kappa^2 ||v||^2 + ||v'||_{T_h}^2 + gamma/h ||[v]||_{F_h}^2  (jumps on all faces)
- *   Robin:     |||v|||_dG^2 = kappa^2 ||v||^2 + ||v'||_{T_h}^2 + gamma/h ||[v]||_{F_h^o}^2 + kappa ||v||_{dOmega}^2
- * (-1 if the exact derivative is not provided).
+ *   Dirichlet: |||v|||_dG^2 = kappa^2 ||v||^2 + ||grad_h v||^2 + sum_{F in F_h}   gamma/h_F ||[v]||_F^2
+ *   Robin:     |||v|||_dG^2 = kappa^2 ||v||^2 + ||grad_h v||^2 + sum_{F in F_h^o} gamma/h_F ||[v]||_F^2 + kappa ||v||_{dOmega}^2
+ * (-1 if the exact gradient is not provided). The exact solution has no jumps and vanishes on a Dirichlet boundary.
  */
 std::string IPDGSolver::extra_error_header() const
 {
@@ -161,27 +138,29 @@ std::string IPDGSolver::extra_error_header() const
 std::string IPDGSolver::extra_error_columns(const ErrorNorms &norms) const
 {
     double error_energy = -1.;
-    if (du_exact)
+    if (grad_u_exact)
     {
-        /* interior jumps of u_h (the exact solution has no jumps) */
-        double jumps_sq = 0.;
-        for (size_t e = 0; e + 1 < mesh.N; e++)
-            jumps_sq += std::norm(eval_u(e, 1.) - eval_u(e + 1, -1.));
+        double jumps_sq = 0.;                    // sum_F gamma/h_F ||[u - u_h]||_F^2
+        double err_bnd_sq = 0., sol_bnd_sq = 0.; // kappa ||.||_{dOmega}^2 (Robin)
 
-        double err_bnd_sq = 0., sol_bnd_sq = 0.;
-        if (bc_type == Dirichlet)
-            /* boundary jumps = traces of u_h (u = 0 on the boundary) */
-            jumps_sq += std::norm(eval_u(0, -1.)) + std::norm(eval_u(mesh.N - 1, 1.));
-        else
-        {
-            /* kappa ||.||_{dOmega}^2 */
-            complex<double> u0 = u_exact(0.), uL = u_exact(mesh.L);
-            err_bnd_sq = kappa * (std::norm(eval_u(0, -1.) - u0) + std::norm(eval_u(mesh.N - 1, 1.) - uL));
-            sol_bnd_sq = kappa * (std::norm(u0) + std::norm(uL));
-        }
+        for (const Face &F : mesh.faces)
+            for (const FaceQuadPoint &qp : face_quadrature(F))
+            {
+                complex<double> u_plus = eval_u(F.elem[0], qp.xi[0]);
+                if (!F.boundary)
+                    jumps_sq += gamma / F.h * qp.w * std::norm(u_plus - eval_u(F.elem[1], qp.xi[1]));
+                else if (bc_type == Dirichlet)
+                    jumps_sq += gamma / F.h * qp.w * std::norm(u_plus);
+                else
+                {
+                    complex<double> u_ex = u_exact(qp.x);
+                    err_bnd_sq += kappa * qp.w * std::norm(u_plus - u_ex);
+                    sol_bnd_sq += kappa * qp.w * std::norm(u_ex);
+                }
+            }
 
         double k2 = kappa * kappa;
-        error_energy = std::sqrt((k2 * norms.err_L2_sq + norms.err_H1_sq + gamma / mesh.h * jumps_sq + err_bnd_sq) /
+        error_energy = std::sqrt((k2 * norms.err_L2_sq + norms.err_H1_sq + jumps_sq + err_bnd_sq) /
                                  (k2 * norms.sol_L2_sq + norms.sol_H1_sq + sol_bnd_sq));
     }
 

@@ -1,51 +1,45 @@
 #include <iostream>
 #include <fstream>
-#include <sstream>
+#include <stdexcept>
 #include <cmath>
 #include "dg_solver.h"
 #include "quadrature.h"
 using namespace std;
+
+static std::unique_ptr<ReferenceElement> make_reference_element(size_t dim, size_t degree)
+{
+    if (dim == 1)
+        return std::make_unique<ReferenceInterval>(degree);
+    throw std::invalid_argument("DGSolver: no reference element available in dimension " + std::to_string(dim));
+}
 
 DGSolver::DGSolver(const Mesh &input_mesh,
                    size_t degree,
                    size_t input_n_fields,
                    double input_kappa,
                    BCType input_bc_type,
-                   RhsFunction input_f_rhs,
-                   RhsFunction input_u_exact,
-                   RhsFunction input_du_exact)
+                   ScalarFunction input_f_rhs,
+                   ScalarFunction input_u_exact,
+                   VectorFunction input_grad_u_exact)
     : mesh(input_mesh),
-      ref_element(degree),
+      ref(make_reference_element(input_mesh.dim, degree)),
       n_fields(input_n_fields),
       kappa(input_kappa),
       bc_type(input_bc_type),
       f_rhs(input_f_rhs),
       u_exact(input_u_exact),
-      du_exact(input_du_exact)
+      grad_u_exact(input_grad_u_exact)
 {
-    /* ---------- MEMORY ALLOCATION ---------- */
     size_t n_loc = n_local_dofs();
-    size_t total_dofs = n_fields * mesh.N * n_loc;
+    size_t total_dofs = n_fields * mesh.n_elements() * n_loc;
 
     A.resize(total_dofs, total_dofs);
     u.resize(total_dofs);
     b = Eigen::VectorXcd::Zero(total_dofs);
 
-    /* volume block + 4 interface blocks per element and per pair of fields */
-    tripletList.reserve(5 * n_fields * n_fields * mesh.N * n_loc * n_loc);
-
-    /* ---------- TRACES OF THE REFERENCE BASIS ---------- */
-    phi_L.resize(n_loc);
-    phi_R.resize(n_loc);
-    dphi_L.resize(n_loc);
-    dphi_R.resize(n_loc);
-    for (size_t i = 0; i < n_loc; i++)
-    {
-        phi_L[i] = ref_element.eval_basis(i, -1.0);
-        phi_R[i] = ref_element.eval_basis(i, 1.0);
-        dphi_L[i] = ref_element.eval_basis_deriv(i, -1.0);
-        dphi_R[i] = ref_element.eval_basis_deriv(i, 1.0);
-    }
+    /* one volume block per element + one (2 x 2 blocks) per face */
+    size_t block = n_fields * n_loc;
+    tripletList.reserve(mesh.n_elements() * block * block + 4 * mesh.faces.size() * block * block);
 }
 
 /* ======================================================================= */
@@ -54,60 +48,112 @@ DGSolver::DGSolver(const Mesh &input_mesh,
 
 void DGSolver::assemble()
 {
-    assemble_volume();
-    assemble_interfaces();
-    assemble_boundaries();
+    for (size_t e = 0; e < mesh.n_elements(); e++)
+        assemble_element(e);
+
+    for (const Face &F : mesh.faces)
+    {
+        if (F.boundary)
+            assemble_boundary_face(F);
+        else
+            assemble_interface(F);
+    }
+
     A.setFromTriplets(tripletList.begin(), tripletList.end());
     tripletList.clear();
 
     assemble_rhs();
 }
 
+void DGSolver::scatter(const std::vector<size_t> &dofs, const Eigen::MatrixXcd &A_loc)
+{
+    for (size_t a = 0; a < dofs.size(); a++)
+        for (size_t c = 0; c < dofs.size(); c++)
+            if (A_loc(a, c) != 0.)
+                tripletList.push_back(TripletComplex(dofs[a], dofs[c], A_loc(a, c)));
+}
+
 void DGSolver::assemble_rhs()
 {
-    size_t n_loc = n_local_dofs();
-    double J = mesh.h / 2;
-    QuadratureRule quad_rule = get_gauss_legendre(n_loc);
+    QuadratureRule quad = ref->quadrature(2 * ref->degree + 1);
 
-    for (size_t e = 0; e < mesh.N; e++)
+    for (size_t e = 0; e < mesh.n_elements(); e++)
     {
-        double x_c = 0.5 * (mesh.positions[e] + mesh.positions[e + 1]);
-
-        for (size_t q = 0; q < n_loc; q++)
+        const Element &K = mesh.elements[e];
+        for (size_t q = 0; q < quad.size(); q++)
         {
-            double xi_q = quad_rule.points[q];
-            double w_q = quad_rule.weights[q];
-            complex<double> f_val = f_rhs(x_c + J * xi_q);
+            complex<double> f_val = f_rhs(K.map(quad.points[q]));
+            Eigen::VectorXd phi = basis_values(quad.points[q]);
+            double w = K.det_J * quad.weights[q];
 
-            for (size_t i = 0; i < n_loc; i++)
-                b(local_to_global(e, U, i)) += J * w_q * f_val * ref_element.eval_basis(i, xi_q);
+            for (size_t i = 0; i < n_local_dofs(); i++)
+                b(local_to_global(e, U, i)) += w * f_val * phi(i);
         }
     }
 }
 
 /* ======================================================================= */
-/*                                 HELPERS                                 */
+/*                          DOFS AND BASIS FUNCTIONS                       */
 /* ======================================================================= */
 
-size_t DGSolver::local_to_global(size_t element, Variable var, size_t local_dof) const
+size_t DGSolver::local_to_global(size_t element, size_t field, size_t local_dof) const
 {
-    return (n_fields * element + var) * n_local_dofs() + local_dof;
+    return (n_fields * element + field) * n_local_dofs() + local_dof;
 }
 
-complex<double> DGSolver::eval_u(size_t element, double xi) const
+Eigen::VectorXd DGSolver::basis_values(const Point &xi) const
+{
+    Eigen::VectorXd phi(n_local_dofs());
+    for (size_t i = 0; i < n_local_dofs(); i++)
+        phi(i) = ref->eval_basis(i, xi);
+    return phi;
+}
+
+Eigen::MatrixXd DGSolver::basis_grads(size_t element, const Point &xi) const
+{
+    const Element &K = mesh.elements[element];
+    Eigen::MatrixXd grads(n_local_dofs(), dim());
+    for (size_t i = 0; i < n_local_dofs(); i++)
+        grads.row(i) = (K.J_inv_T * ref->eval_grad(i, xi)).transpose();
+    return grads;
+}
+
+complex<double> DGSolver::eval_u(size_t element, const Point &xi) const
 {
     complex<double> val(0., 0.);
     for (size_t i = 0; i < n_local_dofs(); i++)
-        val += u(local_to_global(element, U, i)) * ref_element.eval_basis(i, xi);
+        val += u(local_to_global(element, U, i)) * ref->eval_basis(i, xi);
     return val;
 }
 
-complex<double> DGSolver::eval_du(size_t element, double xi) const
+CPoint DGSolver::eval_grad_u(size_t element, const Point &xi) const
 {
-    complex<double> val(0., 0.);
+    Eigen::MatrixXd grads = basis_grads(element, xi);
+    CPoint val = CPoint::Zero(dim());
     for (size_t i = 0; i < n_local_dofs(); i++)
-        val += u(local_to_global(element, U, i)) * ref_element.eval_basis_deriv(i, xi);
-    return 2. / mesh.h * val;
+        val += u(local_to_global(element, U, i)) * grads.row(i).transpose().cast<complex<double>>();
+    return val;
+}
+
+/* ======================================================================= */
+/*                             FACE QUADRATURE                             */
+/* ======================================================================= */
+
+std::vector<DGSolver::FaceQuadPoint> DGSolver::face_quadrature(const Face &F) const
+{
+    QuadratureRule quad = ref->face_quadrature(2 * ref->degree);
+    std::vector<FaceQuadPoint> pts(quad.size());
+
+    for (size_t q = 0; q < quad.size(); q++)
+    {
+        const Point &eta = quad.points[q];
+        pts[q].xi[0] = ref->face_to_element(F.local_face[0], eta);
+        pts[q].xi[1] = F.boundary ? pts[q].xi[0]
+                                  : ref->face_to_element(F.local_face[1], F.flip ? Point(-eta) : eta);
+        pts[q].x = mesh.elements[F.elem[0]].map(pts[q].xi[0]);
+        pts[q].w = F.jac * quad.weights[q];
+    }
+    return pts;
 }
 
 /* ======================================================================= */
@@ -141,59 +187,47 @@ void DGSolver::solve()
 /*                             POST-PROCESSING                             */
 /* ======================================================================= */
 
+/* Writes "x[,y[,z]],u_real,u_imag,rhs_real,rhs_imag" at sample points of every element */
+static void write_samples(const std::string &filename, const Mesh &mesh, const ReferenceElement &ref,
+                          const std::function<complex<double>(size_t, const Point &, const Point &)> &value,
+                          const ScalarFunction &rhs)
+{
+    const char *coords[3] = {"x", "y", "z"};
+    std::ofstream out(filename);
+    for (size_t k = 0; k < mesh.dim; k++)
+        out << coords[k] << ",";
+    out << "u_real,u_imag,rhs_real,rhs_imag\n";
+
+    std::vector<Point> samples = ref.sample_points(5);
+    for (size_t e = 0; e < mesh.n_elements(); e++)
+        for (const Point &xi : samples)
+        {
+            Point x = mesh.elements[e].map(xi);
+            complex<double> val = value(e, xi, x);
+            complex<double> rhs_val = rhs(x);
+            for (size_t k = 0; k < mesh.dim; k++)
+                out << x(k) << ",";
+            out << val.real() << "," << val.imag() << "," << rhs_val.real() << "," << rhs_val.imag() << "\n";
+        }
+}
+
 void DGSolver::post_process_u()
 {
     std::cout << "Exportation of the solution in solution_u.csv..." << std::endl;
-    std::ofstream out("solution_u.csv");
-    out << "x,u_real,u_imag,rhs_real,rhs_imag\n";
-
-    size_t n_plot_points = 5; // per element
-    for (size_t e = 0; e < mesh.N; e++)
-    {
-        double x_L = mesh.positions[e];
-        double x_R = mesh.positions[e + 1];
-
-        for (size_t p = 0; p <= n_plot_points; p++)
-        {
-            double xi = -1.0 + 2.0 * (double)p / n_plot_points;
-            double x_phys = x_L + (xi + 1.0) * (x_R - x_L) / 2.0;
-
-            complex<double> u_val = eval_u(e, xi);
-            complex<double> rhs_val = f_rhs(x_phys);
-
-            out << x_phys << ","
-                << u_val.real() << "," << u_val.imag() << ","
-                << rhs_val.real() << "," << rhs_val.imag() << "\n";
-        }
-    }
+    write_samples("solution_u.csv", mesh, *ref,
+                  [this](size_t e, const Point &xi, const Point &)
+                  { return eval_u(e, xi); },
+                  f_rhs);
     std::cout << "Success!" << std::endl;
 }
 
 void DGSolver::post_process_u_exact()
 {
     std::cout << "Exportation of the exact solution in solution_exact.csv..." << std::endl;
-    std::ofstream out("solution_exact.csv");
-    out << "x,u_real,u_imag,rhs_real,rhs_imag\n";
-
-    size_t n_plot_points = 5; // per element
-    for (size_t e = 0; e < mesh.N; e++)
-    {
-        double x_L = mesh.positions[e];
-        double x_R = mesh.positions[e + 1];
-
-        for (size_t p = 0; p <= n_plot_points; p++)
-        {
-            double xi = -1.0 + 2.0 * (double)p / n_plot_points;
-            double x_phys = x_L + (xi + 1.0) * (x_R - x_L) / 2.0;
-
-            complex<double> u_val = u_exact(x_phys);
-            complex<double> rhs_val = f_rhs(x_phys);
-
-            out << x_phys << ","
-                << u_val.real() << "," << u_val.imag() << ","
-                << rhs_val.real() << "," << rhs_val.imag() << "\n";
-        }
-    }
+    write_samples("solution_exact.csv", mesh, *ref,
+                  [this](size_t, const Point &, const Point &x)
+                  { return u_exact(x); },
+                  f_rhs);
     std::cout << "Success!" << std::endl;
 }
 
@@ -247,29 +281,26 @@ void DGSolver::plot_error()
 DGSolver::ErrorNorms DGSolver::integrate_errors() const
 {
     ErrorNorms norms;
+    QuadratureRule quad = ref->quadrature(2 * ref->degree + 3);
 
-    double J = mesh.h / 2.0;
-    QuadratureRule quad_rule = get_gauss_legendre(n_local_dofs() + 1);
-
-    for (size_t e = 0; e < mesh.N; e++)
+    for (size_t e = 0; e < mesh.n_elements(); e++)
     {
-        double x_L = mesh.positions[e];
-
-        for (size_t q = 0; q < quad_rule.points.size(); q++)
+        const Element &K = mesh.elements[e];
+        for (size_t q = 0; q < quad.size(); q++)
         {
-            double xi = quad_rule.points[q];
-            double w_q = quad_rule.weights[q];
-            double x_phys = x_L + (xi + 1.0) * J;
+            const Point &xi = quad.points[q];
+            Point x = K.map(xi);
+            double w = K.det_J * quad.weights[q];
 
-            complex<double> u_ex = u_exact(x_phys);
-            norms.err_L2_sq += J * w_q * std::norm(eval_u(e, xi) - u_ex);
-            norms.sol_L2_sq += J * w_q * std::norm(u_ex);
+            complex<double> u_ex = u_exact(x);
+            norms.err_L2_sq += w * std::norm(eval_u(e, xi) - u_ex);
+            norms.sol_L2_sq += w * std::norm(u_ex);
 
-            if (du_exact)
+            if (grad_u_exact)
             {
-                complex<double> du_ex = du_exact(x_phys);
-                norms.err_H1_sq += J * w_q * std::norm(eval_du(e, xi) - du_ex);
-                norms.sol_H1_sq += J * w_q * std::norm(du_ex);
+                CPoint g_ex = grad_u_exact(x);
+                norms.err_H1_sq += w * (eval_grad_u(e, xi) - g_ex).squaredNorm();
+                norms.sol_H1_sq += w * g_ex.squaredNorm();
             }
         }
     }
@@ -297,8 +328,8 @@ void DGSolver::compute_errors(const std::string &filename)
     if (!file_exists)
         out << "N,degree,kappa/Pi," << extra_error_header() << "error_L2\n";
 
-    out << mesh.N << ","
-        << ref_element.degree << ","
+    out << mesh.n_elements() << ","
+        << ref->degree << ","
         << kappa / M_PI << ","
         << extra_error_columns(norms)
         << std::scientific << error_L2 << "\n";
